@@ -1,31 +1,29 @@
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
 import datetime as dt
+import zoneinfo
 
-import numpy as np
 import astropy.units as u
-from astropy.time import Time
-from astropy.coordinates import Galactic, SkyCoord, get_sun, get_moon
-from astropy.utils import minversion
+import numpy as np
 import pytest
+from astropy.coordinates import (Angle, EarthLocation, Galactic, HADec, SkyCoord,
+                                 get_sun, get_body)
+from astropy.time import Time
 
-from ..observer import Observer
-from ..target import FixedTarget, get_skycoord
-from ..constraints import (AltitudeConstraint, AirmassConstraint, AtNightConstraint,
-                           is_observable, is_always_observable, observability_table,
-                           time_grid_from_range,
-                           GalacticLatitudeConstraint,
-                           SunSeparationConstraint,
-                           MoonSeparationConstraint, MoonIlluminationConstraint,
-                           TimeConstraint, LocalTimeConstraint, months_observable,
-                           max_best_rescale, min_best_rescale, PhaseConstraint,
-                           PrimaryEclipseConstraint, SecondaryEclipseConstraint,
-                           is_event_observable)
-from ..periodic import EclipsingSystem
-from ..exceptions import MissingConstraintWarning
-
-
-APY_LT104 = not minversion('astropy', '1.0.4')
+from astroplan.constraints import (
+    AltitudeConstraint, AirmassConstraint, AtNightConstraint,
+    is_observable, is_always_observable, observability_table,
+    time_grid_from_range,
+    GalacticLatitudeConstraint,
+    SunSeparationConstraint,
+    MoonSeparationConstraint, MoonIlluminationConstraint,
+    TimeConstraint, LocalTimeConstraint, months_observable,
+    max_best_rescale, min_best_rescale, PhaseConstraint,
+    PrimaryEclipseConstraint, SecondaryEclipseConstraint,
+    is_event_observable, MeridianSeparationConstraint,
+    HourAngleConstraint)
+from astroplan.exceptions import MissingConstraintWarning
+from astroplan.observer import Observer
+from astroplan.periodic import EclipsingSystem
+from astroplan.target import FixedTarget, AltAzTarget, get_skycoord
 
 vega = FixedTarget(coord=SkyCoord(ra=279.23473479*u.deg, dec=38.78368896*u.deg),
                    name="Vega")
@@ -35,6 +33,7 @@ polaris = FixedTarget(coord=SkyCoord(ra=37.95456067*u.deg,
                                      dec=89.26410897*u.deg), name="Polaris")
 
 
+@pytest.mark.remote_data
 def test_at_night_basic():
     subaru = Observer.at_site("Subaru")
     time_ranges = [Time(['2001-02-03 04:05:06', '2001-02-04 04:05:06']),  # 1 day
@@ -55,6 +54,7 @@ def test_at_night_basic():
                    len(targets)*[observer_is_night_all])
 
 
+@pytest.mark.remote_data
 def test_observability_table():
     subaru = Observer.at_site("Subaru")
     # time_ranges = [Time(['2001-02-03 04:05:06', '2001-02-04 04:05:06']),  # 1 day
@@ -98,6 +98,54 @@ def test_observability_table():
     assert 'time observable' in stab.colnames
 
 
+@pytest.mark.remote_data
+def test_altitude_constraint():
+    subaru = Observer.at_site("Subaru")
+    time = Time('2001-02-03 15:35:00')
+    time_range = Time([time, time+3*u.hour])
+
+    constraint = AltitudeConstraint(min=40*u.deg, max=50*u.deg, boolean_constraint=False)
+    results = constraint(subaru, vega, times=time_grid_from_range(time_range))
+    # Check if below min and above max values are 0
+    assert np.all([results != 0][0] == [False, False, True,  True,  False, False])
+
+
+def test_altitude_constraint_accepts_altaztarget():
+    location = EarthLocation.from_geodetic(10*u.deg, 45*u.deg, 0*u.m)
+    observer = Observer(location=location)
+    target = AltAzTarget(alt=60*u.deg, az=180*u.deg, location=location, name="horiz")
+    c = AltitudeConstraint(min=30*u.deg)
+
+    # Scalar Time
+    t = Time("2026-02-05T00:00:00", scale="utc")
+    result = c(observer, target, times=t)
+    assert result.shape == ()
+    assert np.all(result)
+
+    # Vector time, no grid
+    t0 = Time("2026-01-01T00:00:00", scale="utc")
+    times = t0 + np.arange(5) * u.hour
+    result = c(observer, target, times=times, grid_times_targets=False)
+    assert result.shape == times.shape
+    assert np.all(result)
+
+    # Vector time, grid
+    result = c(observer, target, times=times, grid_times_targets=True)
+    assert result.shape == (1, len(times))
+    assert np.all(result)
+
+    # Vector time, grid, multiple targets
+    targets = [
+        AltAzTarget(alt=60*u.deg, az=180*u.deg, location=location, name="h1"),
+        AltAzTarget(alt=40*u.deg, az=90*u.deg, location=location, name="h2"),
+    ]
+    result = c(observer, targets, times=times, grid_times_targets=True)
+    assert result.shape == (len(targets), len(times))
+    assert np.all(result[0, :])
+    assert np.all(result[1, :])
+
+
+@pytest.mark.remote_data
 def test_compare_altitude_constraint_and_observer():
     time = Time('2001-02-03 04:05:06')
     time_ranges = [Time([time, time+1*u.hour]) + offset
@@ -119,6 +167,7 @@ def test_compare_altitude_constraint_and_observer():
         assert all(always_from_observer == always_from_constraint)
 
 
+@pytest.mark.remote_data
 def test_compare_airmass_constraint_and_observer():
     time = Time('2001-02-03 04:05:06')
     time_ranges = [Time([time, time+1*u.hour]) + offset
@@ -140,6 +189,7 @@ def test_compare_airmass_constraint_and_observer():
         assert all(always_from_observer == always_from_constraint)
 
 
+@pytest.mark.remote_data
 def test_galactic_plane_separation():
     time = Time('2003-04-05 06:07:08')
     apo = Observer.at_site("APO")
@@ -163,8 +213,135 @@ def test_galactic_plane_separation():
     assert np.all(is_constraint_met == [False, True, True])
 
 
-# in astropy before v1.0.4, a recursion error is triggered by this test
-@pytest.mark.skipif('APY_LT104')
+def test_hour_angle_constraint():
+    time = Time('2003-04-05 06:07:08')
+    apo = Observer.at_site("APO")
+    targets = [vega, rigel, polaris]
+
+    constraint = HourAngleConstraint()
+
+    is_constraint_met = constraint(times=time, observer=apo, targets=targets)
+    assert np.all(is_constraint_met == [False, False, False])
+
+    time = Time('2003-10-05 06:07:08')
+    is_constraint_met = constraint(times=time, observer=apo, targets=targets)
+    assert np.all(is_constraint_met == [True, True, True])
+
+
+def _hour_angle_grid():
+    # Targets placed relative to the LST at t0, so their hour angles at t0 are
+    # -4.5h, -1.5h, 1.5h and -10.5h, and grow by ~2.005h per step. Every value
+    # is at least 0.45h from the +/-3h limits used below.
+    apo = Observer.at_site("APO")
+    t0 = Time('2026-10-21 06:00')
+    times = t0 + [0, 2, 4, 6]*u.hour
+    hour_angles_t0 = [-4.5, -1.5, 1.5, -10.5]*u.hourangle
+    coords = SkyCoord(ra=apo.local_sidereal_time(t0) - hour_angles_t0,
+                      dec=[0, 30, -30, 60]*u.deg)
+    targets = [FixedTarget(coord=coord, name=str(i)) for i, coord in enumerate(coords)]
+    expected = np.array([[False, True, True, True],
+                         [True, True, True, False],
+                         [True, False, False, False],
+                         [False, False, False, False]])
+    return apo, targets, times, expected
+
+
+def test_hour_angle_constraint_grid():
+    apo, targets, times, expected = _hour_angle_grid()
+    constraint = HourAngleConstraint(min=-3*u.hourangle, max=3*u.hourangle)
+
+    result = constraint(apo, targets, times=times, grid_times_targets=True)
+    np.testing.assert_array_equal(result, expected)
+
+    table = observability_table(constraint, apo, targets, times=times)
+    np.testing.assert_allclose(table['fraction of time observable'],
+                               expected.mean(axis=1))
+
+
+def test_hour_angle_constraint_shapes():
+    apo, targets, times, expected = _hour_angle_grid()
+    constraint = HourAngleConstraint(min=-3*u.hourangle, max=3*u.hourangle)
+
+    # single target at a single time
+    result = constraint(apo, targets[1], times=times[0])
+    assert np.shape(result) == ()
+    assert result
+    np.testing.assert_array_equal(constraint(apo, [targets[1]], times=times[0]), [True])
+
+    # scalar SkyCoord with an array of times
+    result = constraint(apo, targets[0].coord, times=times)
+    np.testing.assert_array_equal(result, expected[0])
+
+    # N targets and N times without gridding are paired elementwise
+    result = constraint(apo, targets, times=times)
+    np.testing.assert_array_equal(result, np.diag(expected))
+
+
+def test_hour_angle_constraint_wrapped_window():
+    apo, _, times, _ = _hour_angle_grid()
+    # hour angles of 9h, 11.0h, -11.0h and -9.0h at the four times
+    target = SkyCoord(ra=apo.local_sidereal_time(times[0]) - 9*u.hourangle, dec=80*u.deg)
+
+    constraint = HourAngleConstraint(min=150*u.deg, max=-150*u.deg)
+    np.testing.assert_array_equal(constraint(apo, target, times=times),
+                                  [False, True, True, False])
+
+
+@pytest.mark.parametrize('limits, in_window', [
+    (dict(), lambda ha: abs(ha) <= 5.5),
+    (dict(min=-45*u.deg, max=2*u.hourangle), lambda ha: (-3 <= ha) & (ha <= 2)),
+    (dict(min=None, max=-1*u.hourangle), lambda ha: ha <= -1),
+    (dict(min=4*u.hourangle, max=None), lambda ha: ha >= 4),
+    (dict(min=10*u.hourangle, max=-10*u.hourangle), lambda ha: abs(ha) >= 10),
+])
+def test_hour_angle_constraint_matches_hadec(limits, in_window):
+    apo = Observer.at_site("APO")
+    rng = np.random.default_rng(560)
+    targets = SkyCoord(ra=rng.uniform(0, 360, 20)*u.deg,
+                       dec=rng.uniform(-30, 70, 20)*u.deg)
+    times = Time('2026-10-21 00:00') + np.linspace(0, 24, 49)*u.hour
+
+    constraint = HourAngleConstraint(**limits)
+    result = constraint(apo, targets, times=times, grid_times_targets=True)
+
+    hadec = targets[:, np.newaxis].transform_to(HADec(obstime=times, location=apo.location))
+    ha = hadec.ha.wrap_at(12*u.hourangle)
+    # Observer.target_hour_angle uses the same apparent HADec frame, so only
+    # skip values within rounding distance of a limit or of the 12h wrap.
+    edges = u.Quantity([constraint.min, constraint.max, 12*u.hourangle])
+    distance = Angle(ha[..., np.newaxis] - edges).wrap_at(12*u.hourangle)
+    far = np.all(np.abs(distance) > 1*u.arcsec, axis=-1)
+
+    assert result.shape == (20, 49)
+    assert far.mean() > 0.99
+    np.testing.assert_array_equal(result[far], in_window(ha.hourangle)[far])
+    assert 0 < result[far].sum() < far.sum()
+
+
+def test_hour_angle_constraint_limits():
+    constraint = HourAngleConstraint(min=30*u.deg)
+    assert constraint.min.unit == u.hourangle
+    assert u.isclose(constraint.min, 2*u.hourangle)
+    assert u.isclose(constraint.max, 5.5*u.hourangle)
+
+    constraint = HourAngleConstraint(min=None, max=1*u.hourangle)
+    assert u.isclose(constraint.min, -12*u.hourangle)
+
+    with pytest.raises(ValueError, match='at least one of min or max'):
+        HourAngleConstraint(min=None, max=None)
+    with pytest.raises(u.UnitTypeError):
+        HourAngleConstraint(min=-3, max=3)
+    with pytest.raises(ValueError, match='must be scalars'):
+        HourAngleConstraint(min=[-1, 1]*u.hourangle)
+    for kwargs in [{'min': -13*u.hourangle}, {'max': 200*u.deg},
+                   {'min': 12*u.hourangle, 'max': -12*u.hourangle},
+                   {'min': 12*u.hourangle}, {'max': -12*u.hourangle}]:
+        with pytest.raises(ValueError, match=r'\[-12h, 12h\) and the maximum in \(-12h, 12h\]'):
+            HourAngleConstraint(**kwargs)
+    HourAngleConstraint(min=-12*u.hourangle, max=12*u.hourangle)
+
+
+@pytest.mark.remote_data
 def test_sun_separation():
     time = Time('2003-04-05 06:07:08')
     apo = Observer.at_site("APO")
@@ -189,11 +366,24 @@ def test_sun_separation():
     assert np.all(is_constraint_met == [False, True, True])
 
 
+def test_meridian_separation():
+    time_range = Time(["2024-10-08 21:00", "2024-10-08 23:00"])
+    target = FixedTarget(coord=SkyCoord(ra=19.75*u.hour, dec=-22.50*u.deg), name="name")
+
+    # Pico dos Dias Observatory (Brazil)
+    opd = Observer(location=EarthLocation(lat=-22.53, lon=-45.58, height=1864))
+    constraint = MeridianSeparationConstraint(min=3*u.deg, max=35*u.deg)
+
+    results = constraint(opd, target, times=time_grid_from_range(time_range))
+    assert np.all(results == [True, False, True, True, True])
+
+
+@pytest.mark.remote_data
 def test_moon_separation():
     time = Time('2003-04-05 06:07:08')
     apo = Observer.at_site("APO")
     altaz_frame = apo.altaz(time)
-    moon = get_moon(time, apo.location).transform_to(altaz_frame)
+    moon = get_body("moon", time, apo.location).transform_to(altaz_frame)
     one_deg_away = SkyCoord(az=moon.az, alt=moon.alt+1*u.deg, frame=altaz_frame)
     five_deg_away = SkyCoord(az=moon.az+5*u.deg, alt=moon.alt,
                              frame=altaz_frame)
@@ -217,6 +407,7 @@ def test_moon_separation():
     assert np.all(is_constraint_met == [False, True, True])
 
 
+@pytest.mark.remote_data
 def test_moon_illumination():
     times = Time(["2015-08-28 03:30", "2015-08-28 12:00",
                   "2015-09-05 10:30", "2015-09-15 18:35"])
@@ -255,6 +446,7 @@ def test_moon_illumination():
     assert np.all(is_constraint_met == [True, False, False, False])
 
 
+@pytest.mark.remote_data
 def test_local_time_constraint_utc():
     time = Time('2001-02-03 04:05:06')
     subaru = Observer.at_site("Subaru")
@@ -271,9 +463,12 @@ def test_local_time_constraint_utc():
     assert is_constraint_met is np.bool_(True)
 
 
+@pytest.mark.remote_data
 def test_local_time_constraint_hawaii_tz():
-    # Define timezone in Observer.timezone
-    time = Time('2001-02-03 04:05:06')
+    # Define timezone in Observer.timezone. 14:05:06 UTC is 04:05:06 in
+    # Hawaii (UTC-10), so the results match test_local_time_constraint_utc
+    # only if times are converted to local time.
+    time = Time('2001-02-03 14:05:06')
     subaru = Observer.at_site("Subaru", timezone="US/Hawaii")
     constraint = LocalTimeConstraint(min=dt.time(23, 50), max=dt.time(4, 8))
     is_constraint_met = constraint(subaru, None, times=time)
@@ -288,6 +483,57 @@ def test_local_time_constraint_hawaii_tz():
     assert is_constraint_met is np.bool_(True)
 
 
+def test_local_time_constraint_uses_local_timezone():
+    # Regression test for https://github.com/astropy/astroplan/issues/466
+    location = EarthLocation.from_geodetic(13.0118*u.deg, 46.4692*u.deg, 750*u.m)
+    rome = zoneinfo.ZoneInfo('Europe/Rome')
+    observer = Observer(location=location, timezone=rome)
+    # 21:05 and 22:05 local time (CEST, UTC+2)
+    times = Time(['2020-04-10 19:05', '2020-04-10 20:05'])
+    constraint = LocalTimeConstraint(min=dt.time(21, 0), max=dt.time(21, 30))
+    np.testing.assert_array_equal(constraint(observer, None, times=times),
+                                  [True, False])
+
+    # Scalar times give a scalar result
+    assert constraint(observer, None, times=times[0]) is np.bool_(True)
+
+    # Multidimensional time grids keep their shape
+    np.testing.assert_array_equal(
+        constraint(observer, None, times=times.reshape(2, 1)), [[True], [False]])
+
+    # Window straddling local midnight: 23:30 and 00:30 local are inside,
+    # 22:30 local is outside
+    midnight = LocalTimeConstraint(min=dt.time(23, 0), max=dt.time(1, 0))
+    np.testing.assert_array_equal(
+        midnight(observer, None,
+                 times=Time(['2020-04-10 21:30', '2020-04-10 22:30', '2020-04-10 20:30'])),
+        [True, True, False])
+
+    # A tzinfo on the limits overrides the observer's timezone
+    utc_observer = Observer(location=location)
+    rome_limits = LocalTimeConstraint(min=dt.time(21, 0, tzinfo=rome),
+                                      max=dt.time(21, 30, tzinfo=rome))
+    np.testing.assert_array_equal(rome_limits(utc_observer, None, times=times),
+                                  [True, False])
+
+    # Only a max limit; min must not be overwritten when computing
+    max_only = LocalTimeConstraint(max=dt.time(21, 30))
+    np.testing.assert_array_equal(max_only(observer, None, times=times),
+                                  [True, False])
+    assert max_only.min is None
+
+
+def test_local_time_constraint_pytz_timezone():
+    pytz = pytest.importorskip('pytz')
+    location = EarthLocation.from_geodetic(13.0118*u.deg, 46.4692*u.deg, 750*u.m)
+    observer = Observer(location=location, timezone=pytz.timezone('Europe/Rome'))
+    times = Time(['2020-04-10 19:05', '2020-04-10 20:05'])
+    constraint = LocalTimeConstraint(min=dt.time(21, 0), max=dt.time(21, 30))
+    np.testing.assert_array_equal(constraint(observer, None, times=times),
+                                  [True, False])
+
+
+@pytest.mark.remote_data
 def test_docs_example():
     # Test the example in astroplan/docs/tutorials/constraints.rst
     target_table_string = """# name ra_degrees dec_degrees
@@ -351,6 +597,7 @@ def test_docs_example():
     assert all(observability == [False, False, True, False, False, False])
 
 
+@pytest.mark.remote_data
 def test_regression_airmass_141():
     subaru = Observer.at_site("Subaru")
     time = Time('2001-1-1 12:00')
@@ -408,11 +655,14 @@ constraint_tests = [
     AtNightConstraint(),
     SunSeparationConstraint(min=90*u.deg),
     MoonSeparationConstraint(min=20*u.deg),
+    MeridianSeparationConstraint(min=3*u.deg),
+    HourAngleConstraint(),
     LocalTimeConstraint(min=dt.time(23, 50), max=dt.time(4, 8)),
     TimeConstraint(*Time(["2015-08-28 03:30", "2015-09-05 10:30"]))
 ]
 
 
+@pytest.mark.remote_data
 @pytest.mark.parametrize('constraint', constraint_tests)
 def test_regression_shapes(constraint):
     times = Time(["2015-08-28 03:30", "2015-09-05 10:30", "2015-09-15 18:35"])
@@ -428,6 +678,7 @@ def test_regression_shapes(constraint):
         constraint(lapalma, targets, times)
 
 
+@pytest.mark.remote_data
 def test_caches_shapes():
     times = Time([2457884.43350526, 2457884.5029497, 2457884.57239415], format='jd')
     m31 = SkyCoord(10.6847929*u.deg, 41.269065*u.deg)
@@ -440,6 +691,7 @@ def test_caches_shapes():
     assert ac(observer, targets, times, grid_times_targets=False).shape == (3,)
 
 
+@pytest.mark.remote_data
 def test_eclipses():
     subaru = Observer.at_site("Subaru")
 
@@ -460,7 +712,22 @@ def test_eclipses():
     times = Time(['2016-01-01 00:00', '2016-01-02 12:00', '2016-01-02 14:00'])
     assert np.all(np.array([False, True, False]) == pc(subaru, None, times))
 
+    # min and max default to the full phase range
+    for kwargs in [{}, {'min': 0.2}, {'max': 0.5}]:
+        pc = PhaseConstraint(eclipsing_system, **kwargs)
+        expected = ((pc.min <= eclipsing_system.phase(times)) &
+                    (eclipsing_system.phase(times) <= pc.max))
+        assert np.all(expected == pc(subaru, None, times))
+    pc = PhaseConstraint(eclipsing_system)
+    assert (pc.min, pc.max) == (0.0, 1.0)
+    assert np.all(pc(subaru, None, times))
 
+    for kwargs in [{'min': -0.1}, {'max': 1.1}, {'min': 2, 'max': 0.5}]:
+        with pytest.raises(ValueError, match='within the interval'):
+            PhaseConstraint(eclipsing_system, **kwargs)
+
+
+@pytest.mark.remote_data
 def test_event_observable():
 
     epoch = Time(2452826.628514, format='jd')

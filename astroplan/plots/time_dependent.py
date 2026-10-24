@@ -1,14 +1,10 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
 import copy
 import numpy as np
-import operator
 import astropy.units as u
 from astropy.time import Time
 from collections.abc import Sequence
 import warnings
-import pytz
 
 from ..exceptions import PlotWarning
 from ..utils import _set_mpl_style_sheet
@@ -48,10 +44,106 @@ def _has_twin(ax):
     return False
 
 
+def _shade_nights(ax, observer, start, end, tzoffset=0*u.hour):
+    """
+    Shade the time between sunset and sunrise, including twilight.
+    """
+    start_jd = start.utc.jd
+    end_jd = end.utc.jd
+    if end_jd <= start_jd:
+        return
+
+    # Sample the Sun's altitude every five minutes.
+    n_intervals = max(1, int(np.ceil((end_jd - start_jd) * 24 * 12)))
+    sample_jds = np.linspace(start_jd, end_jd, n_intervals + 1)
+    times = Time(sample_jds, format='jd', scale='utc')
+    sun_altitudes = observer.sun_altaz(times).alt.to_value(u.deg)
+
+    horizons = np.array([-18, -12, -6, 0])
+    bands = np.searchsorted(horizons, sun_altitudes)
+    changes = np.flatnonzero(np.diff(bands))
+
+    # Interpolate the times when the Sun crosses a twilight boundary.
+    crossing_altitudes = horizons[np.minimum(bands[changes], bands[changes + 1])]
+    fractions = ((crossing_altitudes - sun_altitudes[changes]) /
+                 (sun_altitudes[changes + 1] - sun_altitudes[changes]))
+    crossings = (sample_jds[changes] +
+                 fractions * (sample_jds[changes + 1] - sample_jds[changes]))
+
+    boundaries = np.concatenate(([start_jd], crossings, [end_jd]))
+    alphas = np.array([0.4, 0.3, 0.2, 0.1, 0.0])
+    alphas = alphas[np.r_[bands[0], bands[changes + 1]]]
+    plot_times = (Time(boundaries, format='jd', scale='utc') + tzoffset).plot_date
+
+    for left, right, alpha in zip(plot_times[:-1], plot_times[1:], alphas):
+        if alpha > 0:
+            ax.axvspan(left, right, ymin=0, ymax=1, color='grey', alpha=alpha, linewidth=0)
+
+
+# Line width factor for the part of a curve where constraints are met
+_MET_LINEWIDTH_FACTOR = 2
+
+
+def _constraint_violations(constraints, observer, targets, times):
+    """
+    Evaluate ``constraints`` once for all ``targets`` and return a boolean
+    array of shape (n_targets, n_times), True where any constraint is not met.
+
+    Score constraints (``boolean_constraint=False``) count as met wherever
+    their score is non-zero.
+    """
+    if not hasattr(constraints, '__len__'):
+        constraints = [constraints]
+
+    met = np.logical_and.reduce([
+        np.asarray(constraint(observer, targets, times=times, grid_times_targets=True)) > 0
+        for constraint in constraints
+    ])
+    return ~met
+
+
+def _plot_curve(ax, plot_times, y_values, label, style_kwargs, violated=None):
+    """
+    Plot one target's curve. If ``violated`` (a boolean array, True where a
+    constraint is not met) is given, the curve is drawn with a thicker line
+    where all constraints are met, and with a dashed line of the normal width,
+    in the same color, where they are not.
+
+    The dashed part extends one sample into the neighbouring samples, so it
+    joins the solid curve and a violation of a single sample is still visible.
+    """
+    if violated is None:
+        return ax.plot(plot_times, y_values, label=label, **style_kwargs)
+
+    import matplotlib as mpl
+
+    y_values = np.ma.asarray(y_values)
+    y = u.Quantity(np.ma.getdata(y_values)).value.astype(float)
+    y[np.ma.getmaskarray(y_values)] = np.nan
+
+    violated = np.asarray(violated, dtype=bool)
+    dashed = violated.copy()
+    dashed[1:] |= violated[:-1]
+    dashed[:-1] |= violated[1:]
+
+    default_linewidth = mpl.rcParams['lines.linewidth']
+    linewidth = style_kwargs.get('linewidth', style_kwargs.get('lw', default_linewidth))
+    met_kwargs = {key: val for key, val in style_kwargs.items() if key not in ('lw', 'linewidth')}
+    met_kwargs['linewidth'] = _MET_LINEWIDTH_FACTOR * linewidth
+    line, = ax.plot(plot_times, np.where(violated, np.nan, y), label=label, **met_kwargs)
+
+    dashed_kwargs = {key: val for key, val in style_kwargs.items()
+                     if key not in ('c', 'color', 'ls', 'linestyle')}
+    ax.plot(plot_times, np.where(dashed, y, np.nan), color=line.get_color(), linestyle='--',
+            label='_nolegend_', **dashed_kwargs)
+    return line
+
+
 def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
                  style_sheet=None, brightness_shading=False,
                  altitude_yaxis=False, min_airmass=1.0, min_region=None,
-                 max_airmass=3.0, max_region=None, use_local_tz=False):
+                 max_airmass=3.0, max_region=None, use_local_tz=False,
+                 constraints=None):
     r"""
     Plots airmass as a function of time for a given target.
 
@@ -92,7 +184,7 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
         If None, uses the current ``Axes``.
 
     style_kwargs : dict or None, optional.
-        A dictionary of keywords passed into `~matplotlib.pyplot.plot_date`
+        A dictionary of keywords passed into `~matplotlib.pyplot.plot`
         to set plotting styles.
 
     style_sheet : dict or `None` (optional)
@@ -127,6 +219,12 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
         If the time is specified in a local timezone, the time will be plotted
         in that timezone.
 
+    constraints : `~astroplan.Constraint` or list of `~astroplan.Constraint` (optional)
+        Constraint(s) to show on the curves. Each target's curve is drawn
+        dashed wherever any  constraint is not met, and with a thicker line
+        wherever all are met. Constraints that return a score instead of a
+        boolean count as met wherever the score is non-zero.
+
     Returns
     -------
     ax : `~matplotlib.axes.Axes`
@@ -152,17 +250,18 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
     if style_kwargs is None:
         style_kwargs = {}
     style_kwargs = dict(style_kwargs)
-    style_kwargs.setdefault('linewidth', 1.5)
-    style_kwargs.setdefault('fmt', '-')
+
+    if 'lw' not in style_kwargs:
+        style_kwargs.setdefault('linewidth', 1.5)
+    if 'ls' not in style_kwargs and 'linestyle' not in style_kwargs:
+        style_kwargs.setdefault('linestyle', '-')
 
     if hasattr(time, 'utcoffset') and use_local_tz:
         tzoffset = time.utcoffset()
         tzname = time.tzname()
-        tzinfo = time.tzinfo
     else:
-        tzoffset = 0
+        tzoffset = 0 * u.hour
         tzname = 'UTC'
-        tzinfo = None
     # Populate time window if needed.
     # (plot against local time if that's requested)
     time_ut = Time(time)
@@ -177,7 +276,11 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
     if not isinstance(targets, Sequence):
         targets = [targets]
 
-    for target in targets:
+    # Evaluate every constraint once for all targets (targets x times mask)
+    if constraints is not None:
+        violated = _constraint_violations(constraints, observer, targets, time_ut)
+
+    for i, target in enumerate(targets):
         # Calculate airmass
         airmass = observer.altaz(time_ut, target).secz
         # Mask out nonsense airmasses
@@ -190,10 +293,12 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
             target_name = ''
 
         # Plot data (against timezone-offset time)
-        ax.plot_date(timetoplot.plot_date, masked_airmass, label=target_name, **style_kwargs)
+        _plot_curve(ax, timetoplot.plot_date, masked_airmass, target_name, style_kwargs,
+                    violated=violated[i] if constraints is not None else None)
 
     # Format the time axis
     xlo, xhi = (timetoplot[0]), (timetoplot[-1])
+    ax.xaxis_date()
     ax.set_xlim([xlo.plot_date, xhi.plot_date])
     date_formatter = dates.DateFormatter('%H:%M')
     ax.xaxis.set_major_formatter(date_formatter)
@@ -201,41 +306,7 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
 
     # Shade background during night time
     if brightness_shading:
-        start = time_ut[0]
-
-        # Calculate and order twilights and set plotting alpha for each
-        twilights = [
-            (observer.sun_set_time(start, which='next'), 0.0),
-            (observer.twilight_evening_civil(start, which='next'), 0.1),
-            (observer.twilight_evening_nautical(start, which='next'), 0.2),
-            (observer.twilight_evening_astronomical(start, which='next'), 0.3),
-            (observer.twilight_morning_astronomical(start, which='next'), 0.4),
-            (observer.twilight_morning_nautical(start, which='next'), 0.3),
-            (observer.twilight_morning_civil(start, which='next'), 0.2),
-            (observer.sun_rise_time(start, which='next'), 0.1),
-        ]
-
-        # add 'UTC' to each datetime object created above
-        twilights = [(t[0].datetime.replace(tzinfo=pytz.utc), t[1])
-                     for t in twilights]
-
-        twilights.sort(key=operator.itemgetter(0))
-
-        # add in left & right edges, so that if the airmass plot is requested
-        # during the day, night is properly shaded
-        left_edges = [(xlo.datetime.replace(tzinfo=tzinfo), twilights[0][1])] + twilights
-        right_edges = twilights + [(xhi.datetime.replace(tzinfo=tzinfo), twilights[0][1])]
-
-        for tw_left, tw_right in zip(left_edges, right_edges):
-            left = tw_left[0]
-            right = tw_right[0]
-            if tzinfo is not None:
-                # convert to local time zone (which is plotted), then hack away the tzinfo
-                # so that matplotlib doesn't try to double down on the conversion
-                left = left.astimezone(tzinfo).replace(tzinfo=None)
-                right = right.astimezone(tzinfo).replace(tzinfo=None)
-            ax.axvspan(left, right,
-                       ymin=0, ymax=1, color='grey', alpha=tw_right[1])
+        _shade_nights(ax, observer, time_ut.min(), time_ut.max(), tzoffset=tzoffset)
 
     # Invert y-axis and set limits.
     y_lim = ax.get_ylim()
@@ -276,7 +347,7 @@ def plot_airmass(targets, observer, time, ax=None, style_kwargs=None,
 def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
                   style_sheet=None, brightness_shading=False,
                   airmass_yaxis=False, min_altitude=0, min_region=None,
-                  max_altitude=90, max_region=None):
+                  max_altitude=90, max_region=None, constraints=None):
     r"""
     Plots altitude as a function of time for a given target.
 
@@ -317,7 +388,7 @@ def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
         If None, uses the current ``Axes``.
 
     style_kwargs : dict or None, optional.
-        A dictionary of keywords passed into `~matplotlib.pyplot.plot_date`
+        A dictionary of keywords passed into `~matplotlib.pyplot.plot`
         to set plotting styles.
 
     style_sheet : dict or `None` (optional)
@@ -348,6 +419,12 @@ def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
         If set, defines an interval between ``max_altitude`` and ``max_region``
         that will be shaded. Default is `None`.
 
+    constraints : `~astroplan.Constraint` or list of `~astroplan.Constraint` (optional)
+            Constraint(s) to show on the curves. Each target's curve is drawn
+            dashed wherever any  constraint is not met, and with a thicker line
+            wherever all are met. Constraints that return a score instead of a
+            boolean count as met wherever the score is non-zero.
+
     Returns
     -------
     ax : `~matplotlib.axes.Axes`
@@ -366,9 +443,10 @@ def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
     if style_kwargs is None:
         style_kwargs = {}
     style_kwargs = dict(style_kwargs)
-    style_kwargs.setdefault('linestyle', '-')
-    style_kwargs.setdefault('linewidth', 1.5)
-    style_kwargs.setdefault('fmt', '-')
+    if 'ls' not in style_kwargs and 'linestyle' not in style_kwargs:
+        style_kwargs.setdefault('linestyle', '-')
+    if 'lw' not in style_kwargs:
+        style_kwargs.setdefault('linewidth', 1.5)
 
     # Populate time window if needed.
     time = Time(time)
@@ -382,7 +460,11 @@ def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
     if not isinstance(targets, Sequence):
         targets = [targets]
 
-    for target in targets:
+    # Evaluate every constraint once for all targets (targets x times mask)
+    if constraints is not None:
+        violated = _constraint_violations(constraints, observer, targets, time)
+
+    for i, target in enumerate(targets):
         # Calculate airmass
         altitude = observer.altaz(time, target).alt
         # Mask out nonsense airmasses
@@ -395,9 +477,11 @@ def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
             target_name = ''
 
         # Plot data
-        ax.plot_date(time.plot_date, masked_altitude, label=target_name, **style_kwargs)
+        _plot_curve(ax, time.plot_date, masked_altitude, target_name, style_kwargs,
+                    violated=violated[i] if constraints is not None else None)
 
     # Format the time axis
+    ax.xaxis_date()
     ax.set_xlim([time[0].plot_date, time[-1].plot_date])
     date_formatter = dates.DateFormatter('%H:%M')
     ax.xaxis.set_major_formatter(date_formatter)
@@ -405,24 +489,7 @@ def plot_altitude(targets, observer, time, ax=None, style_kwargs=None,
 
     # Shade background during night time
     if brightness_shading:
-        start = time[0].datetime
-
-        # Calculate and order twilights and set plotting alpha for each
-        twilights = [
-            (observer.sun_set_time(Time(start), which='next').datetime, 0.0),
-            (observer.twilight_evening_civil(Time(start), which='next').datetime, 0.1),
-            (observer.twilight_evening_nautical(Time(start), which='next').datetime, 0.2),
-            (observer.twilight_evening_astronomical(Time(start), which='next').datetime, 0.3),
-            (observer.twilight_morning_astronomical(Time(start), which='next').datetime, 0.4),
-            (observer.twilight_morning_nautical(Time(start), which='next').datetime, 0.3),
-            (observer.twilight_morning_civil(Time(start), which='next').datetime, 0.2),
-            (observer.sun_rise_time(Time(start), which='next').datetime, 0.1),
-        ]
-
-        twilights.sort(key=operator.itemgetter(0))
-        for i, twi in enumerate(twilights[1:], 1):
-            ax.axvspan(twilights[i - 1][0], twilights[i][0],
-                       ymin=0, ymax=1, color='grey', alpha=twi[1])
+        _shade_nights(ax, observer, time.min(), time.max())
 
     # Invert y-axis and set limits.
     # y_lim = ax.get_ylim()
@@ -481,6 +548,7 @@ def plot_schedule_airmass(schedule, show_night=False):
         An ``Axes`` object with added airmass and schedule vs. time plot.
     """
     import matplotlib.pyplot as plt
+    from matplotlib import dates
     blocks = copy.copy(schedule.scheduled_blocks)
     sorted_blocks = sorted(schedule.observing_blocks, key=lambda x: x.priority)
     targets = [block.target for block in sorted_blocks]
@@ -488,28 +556,24 @@ def plot_schedule_airmass(schedule, show_night=False):
           np.linspace(0, (schedule.end_time - schedule.start_time).value, 100) * u.day)
     targ_to_color = {}
     color_idx = np.linspace(0, 1, len(targets))
+
+    if show_night:
+        ax = plt.gca()
+        ax.xaxis_date()
+        _shade_nights(ax, schedule.observer, schedule.start_time, schedule.end_time)
+        if not targets:
+            ax.set_xlim(schedule.start_time.plot_date, schedule.end_time.plot_date)
+            ax.xaxis.set_major_formatter(dates.DateFormatter('%H:%M'))
+            plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+            ax.set_ylim([3.0, 1.0])
+            ax.set_ylabel('Airmass')
+            ax.set_xlabel('Time from {0} [UTC]'.format(schedule.start_time.datetime.date()))
+
     # lighter, bluer colors indicate higher priority
     for target, ci in zip(set(targets), color_idx):
-        plot_airmass(target, schedule.observer, ts, style_kwargs=dict(color=plt.cm.cool(ci)))
+        plot_airmass(target, schedule.observer, ts,
+                     style_kwargs=dict(color=plt.cm.cool(ci)))
         targ_to_color[target.name] = plt.cm.cool(ci)
-    if show_night:
-        # I'm pretty sure this overlaps a lot, creating darker bands
-        for test_time in ts:
-            midnight = schedule.observer.midnight(test_time)
-            previous_sunset = schedule.observer.sun_set_time(
-                midnight, which='previous')
-            next_sunrise = schedule.observer.sun_rise_time(
-                midnight, which='next')
-
-            previous_twilight = schedule.observer.twilight_evening_astronomical(
-                midnight, which='previous')
-            next_twilight = schedule.observer.twilight_morning_astronomical(
-                midnight, which='next')
-
-            plt.axvspan(previous_sunset.plot_date, next_sunrise.plot_date,
-                        facecolor='lightgrey', alpha=0.05)
-            plt.axvspan(previous_twilight.plot_date, next_twilight.plot_date,
-                        facecolor='lightgrey', alpha=0.05)
 
     for block in blocks:
         if hasattr(block, 'target'):
@@ -563,7 +627,7 @@ def plot_parallactic(target, observer, time, ax=None, style_kwargs=None,
         If None, uses the current ``Axes``.
 
     style_kwargs : dict or None, optional.
-        A dictionary of keywords passed into `~matplotlib.pyplot.plot_date`
+        A dictionary of keywords passed into `~matplotlib.pyplot.plot`
         to set plotting styles.
 
     style_sheet : dict or `None` (optional)
@@ -591,8 +655,8 @@ def plot_parallactic(target, observer, time, ax=None, style_kwargs=None,
     if style_kwargs is None:
         style_kwargs = {}
     style_kwargs = dict(style_kwargs)
-    style_kwargs.setdefault('linestyle', '-')
-    style_kwargs.setdefault('fmt', '-')
+    if 'ls' not in style_kwargs and 'linestyle' not in style_kwargs:
+        style_kwargs.setdefault('linestyle', '-')
 
     # Populate time window if needed.
     time = Time(time)
@@ -616,9 +680,10 @@ def plot_parallactic(target, observer, time, ax=None, style_kwargs=None,
     style_kwargs.setdefault('label', target_name)
 
     # Plot data.
-    ax.plot_date(time.plot_date, p_angle, **style_kwargs)
+    ax.plot(time.plot_date, p_angle, **style_kwargs)
 
     # Format the time axis
+    ax.xaxis_date()
     date_formatter = dates.DateFormatter('%H:%M')
     ax.xaxis.set_major_formatter(date_formatter)
     plt.setp(ax.get_xticklabels(), rotation=30, ha='right')

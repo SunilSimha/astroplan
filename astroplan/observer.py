@@ -1,30 +1,34 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
-from six import string_types
 
 # Standard library
 import sys
 import datetime
 import warnings
+import zoneinfo
+
 # Third-party
-from astropy.coordinates import (EarthLocation, SkyCoord, AltAz, get_sun,
-                                 get_moon, Angle, Longitude)
+
 import astropy.units as u
+import numpy as np
+from astropy.coordinates import (EarthLocation, SkyCoord, AltAz, HADec,
+                                 get_sun, get_body, Angle, Longitude)
 from astropy.time import Time
 from astropy.utils.exceptions import AstropyDeprecationWarning
-import numpy as np
-import pytz
 
 # Package
 from .exceptions import TargetNeverUpWarning, TargetAlwaysUpWarning
 from .moon import moon_illumination, moon_phase_angle
-from .target import get_skycoord, SunFlag, MoonFlag
+from .target import get_skycoord, SunFlag, MoonFlag, Target
 
 
 __all__ = ["Observer"]
 
 MAGIC_TIME = Time(-999, format='jd')
+
+# Rise/set/transit searches cover one day plus this margin (and the target's
+# ``approx_sidereal_drift``, if any), so that an event recurring slightly more
+# than a day later, or falling right at the reference time, is still found.
+_SEARCH_MARGIN = 1 * u.hour
 
 
 # Handle deprecated MAGIC_TIME variable
@@ -32,7 +36,7 @@ def deprecation_wrap_module(mod, deprecated):
     """Return a wrapped object that warns about deprecated accesses"""
     deprecated = set(deprecated)
 
-    class DeprecateWrapper(object):
+    class DeprecateWrapper:
         def __getattr__(self, attr):
             if attr in deprecated:
                 warnmsg = ("`MAGIC_TIME` will be deprecated in future versions "
@@ -58,6 +62,11 @@ def _process_nans_in_jds(jds):
     not_finite = ~np.isfinite(jds)
     masked_jds = np.ma.masked_array(jds.to(u.day).value if hasattr(jds, 'unit') else jds.copy())
     masked_jds[not_finite] = np.ma.masked
+    # Only return a masked array when something is masked: newer astropy keeps
+    # a Time masked even if no elements are, and masked coordinates can't be
+    # transformed.
+    if not np.ma.is_masked(masked_jds):
+        return np.ma.getdata(masked_jds)
     return masked_jds
 
 
@@ -93,10 +102,11 @@ def _generate_24hr_grid(t0, start, end, n_grid_points, for_deriv=False):
     """
 
     if for_deriv:
-        time_grid = np.concatenate([[start - 1 / (n_grid_points - 1)],
+        step = (end - start) / (n_grid_points - 1)
+        time_grid = np.concatenate([[start - step],
                                     np.linspace(start, end,
                                                 n_grid_points)[1:-1],
-                                    [end + 1 / (n_grid_points - 1)]]) * u.day
+                                    [end + step]]) * u.day
     else:
         time_grid = np.linspace(start, end, n_grid_points) * u.day
 
@@ -111,7 +121,39 @@ def _generate_24hr_grid(t0, start, end, n_grid_points, for_deriv=False):
     return t0 + time_grid
 
 
-class Observer(object):
+def _search_window(target, prev_next, n_grid_points):
+    """
+    Bounds and size of the time grid for a rise/set/transit search.
+
+    The grid covers one day plus ``_SEARCH_MARGIN`` and the target's
+    ``approx_sidereal_drift`` (if any), after the reference time for
+    ``prev_next='next'`` and before it for ``'previous'``. The extra time is
+    covered with the same spacing that ``n_grid_points`` gives over one day,
+    so grid points within one day of the reference time don't move.
+
+    Returns
+    -------
+    start, end : float
+        Days before/after the reference time.
+    n_points : int
+        Number of grid points.
+    """
+    extra = _SEARCH_MARGIN + getattr(target, 'approx_sidereal_drift', 0*u.min)
+    n_extra = int(np.ceil(extra.to_value(u.day) * (n_grid_points - 1)))
+    span = 1 + n_extra / (n_grid_points - 1)
+    if prev_next == 'next':
+        return 0, span, n_grid_points + n_extra
+    return -span, 0, n_grid_points + n_extra
+
+
+def _event_jds(event):
+    """JD(UTC) of a possibly masked ``Time``, with NaN where masked."""
+    jds = event.utc.jd
+    jds = np.ma.getdata(getattr(jds, 'unmasked', jds)).astype(float)
+    return np.where(event.mask, np.nan, jds)
+
+
+class Observer:
 
     """
     A container class for information about an observer's location and
@@ -159,7 +201,7 @@ class Observer(object):
 
         timezone : str or `datetime.tzinfo` (optional)
             The local timezone to assume. If a string, it will be passed
-            through ``pytz.timezone()`` to produce the timezone object.
+            through `zoneinfo.ZoneInfo` to produce the timezone object.
 
         name : str
             A short name for the telescope, observatory or location.
@@ -216,8 +258,8 @@ class Observer(object):
         # Accept various timezone inputs, default to UTC
         if isinstance(timezone, datetime.tzinfo):
             self.timezone = timezone
-        elif isinstance(timezone, string_types):
-            self.timezone = pytz.timezone(timezone)
+        elif isinstance(timezone, str):
+            self.timezone = zoneinfo.ZoneInfo(timezone)
         else:
             raise TypeError('timezone keyword should be a string, or an '
                             'instance of datetime.tzinfo')
@@ -249,7 +291,7 @@ class Observer(object):
         >>> print(keck)                                    # doctest: +FLOAT_CMP
         <Observer: name='Keck',
             location (lon, lat, el)=(-155.478333333 deg, 19.8283333333 deg, 4160.0 m),
-            timezone=<DstTzInfo 'US/Hawaii' LMT-1 day, 13:29:00 STD>>
+            timezone=zoneinfo.ZoneInfo(key='US/Hawaii')>
         """
         class_name = self.__class__.__name__
         attr_names = ['name', 'location', 'timezone', 'pressure', 'temperature',
@@ -272,6 +314,85 @@ class Observer(object):
                         value = "'{}'".format(value)
                     attributes_strings.append("{}={}".format(name, value))
         return "<{}: {}>".format(class_name, ",\n    ".join(attributes_strings))
+
+    def _key(self):
+        """
+        Generate a tuple of the attributes that determine uniqueness of
+        `~astroplan.Observer` objects.
+
+        Returns
+        -------
+        key : tuple
+
+        Examples
+        --------
+
+        >>> from astroplan import Observer
+        >>> keck = Observer.at_site("Keck", timezone="US/Hawaii")
+        >>> keck._key()
+        ('Keck', None, None, None, <Longitude -155.47833333 deg>,
+            <Latitude 19.82833333 deg>, <Quantity 4160. m>,
+            <DstTzInfo 'US/Hawaii' LMT-1 day, 13:29:00 STD>)
+        """
+
+        return (self.name,
+                self.pressure,
+                self.temperature,
+                self.relative_humidity,
+                self.longitude,
+                self.latitude,
+                self.elevation,
+                self.timezone,)
+
+    def __hash__(self):
+        """
+        Hash the `~astroplan.Observer` object.
+
+        Examples
+        --------
+
+        >>> from astroplan import Observer
+        >>> keck = Observer.at_site("Keck", timezone="US/Hawaii")
+        >>> hash(keck)
+        -3872382927731250571
+        """
+
+        return hash(self._key())
+
+    def __eq__(self, other):
+        """
+        Equality check for `~astroplan.Observer` objects.
+
+        Examples
+        --------
+
+        >>> from astroplan import Observer
+        >>> keck = Observer.at_site("Keck", timezone="US/Hawaii")
+        >>> keck2 = Observer.at_site("Keck", timezone="US/Hawaii")
+        >>> keck == keck2
+        True
+        """
+
+        if isinstance(other, Observer):
+            return self._key() == other._key()
+        else:
+            return NotImplemented
+
+    def __ne__(self, other):
+        """
+        Inequality check for `~astroplan.Observer` objects.
+
+        Examples
+        --------
+
+        >>> from astroplan import Observer
+        >>> keck = Observer.at_site("Keck", timezone="US/Hawaii")
+        >>> kpno = Observer.at_site("KPNO", timezone="US/Arizona")
+        >>> keck != kpno
+        True
+        """
+
+        return not self.__eq__(other)
 
     @classmethod
     def at_site(cls, site_name, **kwargs):
@@ -313,10 +434,6 @@ class Observer(object):
         Convert the `~astropy.time.Time` object ``astropy_time`` to a
         localized `~datetime.datetime` object.
 
-        Timezones localized with `pytz`_.
-
-        .. _pytz: https://pypi.python.org/pypi/pytz/
-
         Parameters
         ----------
         astropy_time : `~astropy.time.Time`
@@ -345,18 +462,18 @@ class Observer(object):
             return [self.astropy_time_to_datetime(t) for t in astropy_time]
 
         # Convert astropy.time.Time to a UTC localized datetime (aware)
-        utc_datetime = pytz.utc.localize(astropy_time.utc.datetime)
+        utc_datetime = astropy_time.utc.datetime.replace(tzinfo=datetime.timezone.utc)
 
         # Convert UTC to local timezone
-        return self.timezone.normalize(utc_datetime)
+        return utc_datetime.astimezone(self.timezone)
 
     def datetime_to_astropy_time(self, date_time):
         """
         Convert the `~datetime.datetime` object ``date_time`` to a
         `~astropy.time.Time` object.
 
-        Timezones localized with `pytz`_. If the ``date_time`` is naive, the
-        implied timezone is the ``timezone`` structure of ``self``.
+        If the ``date_time`` is naive, the implied timezone is the
+        ``timezone`` structure of ``self``.
 
         Parameters
         ----------
@@ -375,13 +492,12 @@ class Observer(object):
 
         >>> from astroplan import Observer
         >>> import datetime
-        >>> import pytz
         >>> subaru = Observer.at_site("Subaru", timezone="US/Hawaii")
         >>> hi_date_time = datetime.datetime(2005, 6, 21, 20, 0, 0, 0)
         >>> subaru.datetime_to_astropy_time(hi_date_time)
         <Time object: scale='utc' format='datetime' value=2005-06-22 06:00:00>
         >>> utc_date_time = datetime.datetime(2005, 6, 22, 6, 0, 0, 0,
-        ...                                   tzinfo=pytz.timezone("UTC"))
+        ...                                   tzinfo=datetime.timezone.utc)
         >>> subaru.datetime_to_astropy_time(utc_date_time)
         <Time object: scale='utc' format='datetime' value=2005-06-22 06:00:00>
         """
@@ -389,9 +505,13 @@ class Observer(object):
         if hasattr(date_time, '__iter__'):
             return Time([self.datetime_to_astropy_time(t) for t in date_time])
 
-        # For timezone-naive datetimes, assign local timezone
+        # For timezone-naive datetimes, assign local timezone. pytz timezones
+        # must be attached with localize() to get the correct UTC offset.
         if date_time.tzinfo is None:
-            date_time = self.timezone.localize(date_time)
+            if hasattr(self.timezone, 'localize'):
+                date_time = self.timezone.localize(date_time)
+            else:
+                date_time = date_time.replace(tzinfo=self.timezone)
 
         return Time(date_time, location=self.location)
 
@@ -429,22 +549,42 @@ class Observer(object):
             the shapes together using standard numpy rules. Useful for grid
             searches for rise/set times etc.
         """
-        # make sure we have a non-scalar time
         if not isinstance(time, Time):
             time = Time(time)
+
+        # In grid mode, scalar time should still behave like a length-1 time axis
+        if grid_times_targets and time.isscalar:
+            time = time[None]  # shape (1,)
 
         if target is None:
             return time, None
 
+        # Remember whether target is a single time-dependent target
+        is_multiple_targets = isinstance(target, (list, tuple))
+        is_target_time_dependent = isinstance(target, Target) and target.is_time_dependent
+
+        is_single_time_dependent_target = (not is_multiple_targets) and is_target_time_dependent
+
         # convert any kind of target argument to non-scalar SkyCoord
-        target = get_skycoord(target)
+        target = get_skycoord(target, times=time, observer=self)
+
         if grid_times_targets:
+            # Only ambiguous case: a single time-dependent target produces shape == time.shape
+            # but grid mode requires a leading target axis (1, ...).
+            if (
+                is_single_time_dependent_target
+                and (not target.isscalar)
+                and (target.shape == time.shape)
+            ):
+                target = target[np.newaxis, ...]
+
+            # Ensure at least one targets axis for scalar targets
             if target.isscalar:
-                # ensure we have a (1, 1) shape coord
-                target = SkyCoord(np.tile(target, 1))[:, np.newaxis]
-            else:
-                while target.ndim <= time.ndim:
-                    target = target[:, np.newaxis]
+                target = SkyCoord(np.tile(target, 1))  # shape (1,)
+
+            # Make target have one more dim than time (first targets axis, then time axes)
+            while target.ndim < 1 + time.ndim:
+                target = target[..., np.newaxis]
 
         elif not self._is_broadcastable(target.shape, time.shape):
             raise ValueError('Time and Target arguments cannot be broadcast '
@@ -513,7 +653,7 @@ class Observer(object):
         """
         if target is not None:
             if target is MoonFlag:
-                target = get_moon(time, location=self.location)
+                target = get_body("moon", time, location=self.location)
             elif target is SunFlag:
                 target = get_sun(time)
 
@@ -529,8 +669,23 @@ class Observer(object):
         else:
             return target.transform_to(altaz_frame)
 
+    def _hadec(self, time, target, grid_times_targets=False):
+        """
+        Transform ``target`` to the apparent topocentric
+        `~astropy.coordinates.HADec` frame of this observer at ``time``.
+
+        Refraction is not applied.
+        """
+        if target is MoonFlag:
+            target = get_body("moon", time, location=self.location)
+        elif target is SunFlag:
+            target = get_sun(time)
+
+        time, target = self._preprocess_inputs(time, target, grid_times_targets)
+        return target.transform_to(HADec(location=self.location, obstime=time))
+
     def parallactic_angle(self, time, target, grid_times_targets=False,
-                          kind='mean', model=None):
+                          kind=None, model=None):
         """
         Calculate the parallactic angle.
 
@@ -548,14 +703,14 @@ class Observer(object):
             return an (M, N) shaped result. Otherwise, we rely on broadcasting
             the shapes together using standard numpy rules.
 
-        kind : str
-            Argument to the `~astropy.time.Time.sidereal_time` function, which may
-            be either ``'mean'`` or ``'apparent'``, i.e., accounting for precession only,
-            or also for nutation.
+        kind : str or None
+            Deprecated and ignored. The hour angle and declination are now
+            computed in the apparent topocentric
+            `~astropy.coordinates.HADec` frame, so a sidereal time
+            definition is no longer needed.
 
-        model : str or None; optional
-            Precession (and nutation) model to use in the call to
-            `~astropy.time.Time.sidereal_time`, see docs for that method for details.
+        model : str or None
+            Deprecated and ignored, see ``kind``.
 
         Returns
         -------
@@ -568,27 +723,44 @@ class Observer(object):
         intersects a celestial object and the zenith, and the object's hour
         circle [1]_.
 
+        The target is first transformed to the apparent topocentric
+        `~astropy.coordinates.HADec` frame, which accounts for precession,
+        nutation, aberration and (for nearby objects like the Moon)
+        topocentric parallax. The angle is therefore measured from the
+        apparent north celestial pole of date, not from the north pole of the
+        target's input frame (e.g. ICRS). Refraction is not applied.
+
         .. [1] https://en.wikipedia.org/wiki/Parallactic_angle
 
         """
-        time, coordinate = self._preprocess_inputs(time, target, grid_times_targets)
+        if kind is not None or model is not None:
+            warnings.warn("The `kind` and `model` arguments of "
+                          "`Observer.parallactic_angle` are deprecated and "
+                          "ignored; the hour angle is now computed in the "
+                          "apparent HADec frame.", AstropyDeprecationWarning)
+
+        hadec = self._hadec(time, target, grid_times_targets)
+        H = hadec.ha.radian
+        dec = hadec.dec.radian
 
         # Eqn (14.1) of Meeus' Astronomical Algorithms
-        LST = time.sidereal_time(kind, longitude=self.location.lon, model=model)
-        H = (LST - coordinate.ra).radian
         q = np.arctan2(np.sin(H),
-                       (np.tan(self.location.lat.radian) *
-                        np.cos(coordinate.dec.radian) -
-                        np.sin(coordinate.dec.radian)*np.cos(H)))*u.rad
+                       (np.tan(self.location.lat.radian) * np.cos(dec) -
+                        np.sin(dec)*np.cos(H)))*u.rad
 
         return Angle(q)
 
     # Sun-related methods.
     @u.quantity_input(horizon=u.deg)
-    def _horiz_cross(self, t, alt, rise_set, horizon=0*u.degree):
+    def _horiz_cross(self, t, alt, rise_set, horizon=0*u.degree,
+                     prev_next='next'):
         """
         Find time ``t`` when values in array ``a`` go from
         negative to positive or positive to negative (exclude endpoints)
+
+        If the grid contains more than one crossing (possible since the
+        grid can span slightly more than one sidereal day), the first one is
+        used when ``prev_next='next'`` and the last one otherwise.
 
         ``return_limits`` will return nearest times to zero-crossing.
 
@@ -607,6 +779,10 @@ class Observer(object):
             Number of degrees above/below actual horizon to use
             for calculating rise/set times (i.e.,
             -6 deg horizon = civil twilight, etc.)
+        prev_next : {"next", "previous"}
+            Whether the grid runs forward to the next crossing or backward to
+            the previous one, which determines which crossing is used when
+            there is more than one.
 
         Returns
         -------
@@ -644,6 +820,24 @@ class Observer(object):
             # Find index where altitude goes from above to below horizon
             condition = ((alt[:, :-1, ...] > horizon) *
                          (alt[:, 1:, ...] < horizon))
+        else:
+            raise ValueError('"rise_set" must be "rising" or "setting", '
+                             'got {!r}.'.format(rise_set))
+
+        # Keep only the crossing nearest the reference time: the first one
+        # along the grid axis for "next", the last one for "previous"
+        if prev_next == 'next':
+            crossing_index = np.argmax(condition, axis=1)
+        elif prev_next == 'previous':
+            crossing_index = (condition.shape[1] - 1 -
+                              np.argmax(condition[:, ::-1, ...], axis=1))
+        else:
+            raise ValueError('"prev_next" must be "next" or "previous", '
+                             'got {!r}.'.format(prev_next))
+        nearest_crossing = np.zeros_like(condition)
+        np.put_along_axis(nearest_crossing,
+                          np.expand_dims(crossing_index, axis=1), True, axis=1)
+        condition &= nearest_crossing
 
         noncrossing_indices = np.sum(condition, axis=1, dtype=np.intp) < 1
         alt_lims1 = u.Quantity(np.zeros(output_shape), unit=u.deg)
@@ -813,16 +1007,8 @@ class Observer(object):
         if not isinstance(time, Time):
             time = Time(time)
 
-        if prev_next == 'next':
-            start = 0
-            end = (1 + (target.approx_sidereal_drift.to(u.day).value
-                        if hasattr(target, 'approx_sidereal_drift') else 0))
-        else:
-            start = (-1 - (target.approx_sidereal_drift.to(u.day).value
-                           if hasattr(target, 'approx_sidereal_drift') else 0))
-            end = 0
-
-        times = _generate_24hr_grid(time, start, end, n_grid_points)
+        start, end, n_points = _search_window(target, prev_next, n_grid_points)
+        times = _generate_24hr_grid(time, start, end, n_points)
 
         altaz = self.altaz(times, target,
                            grid_times_targets=grid_times_targets)
@@ -830,7 +1016,7 @@ class Observer(object):
         altitudes = altaz.alt
 
         al1, al2, jd1, jd2 = self._horiz_cross(times, altitudes, rise_set,
-                                               horizon)
+                                               horizon, prev_next=prev_next)
         return self._two_point_interp(jd1, jd2, al1, al2,
                                       horizon=horizon)
 
@@ -877,12 +1063,8 @@ class Observer(object):
         if not isinstance(time, Time):
             time = Time(time)
 
-        if prev_next == 'next':
-            times = _generate_24hr_grid(time, 0, 1, n_grid_points,
-                                        for_deriv=True)
-        else:
-            times = _generate_24hr_grid(time, -1, 0, n_grid_points,
-                                        for_deriv=True)
+        start, end, n_points = _search_window(target, prev_next, n_grid_points)
+        times = _generate_24hr_grid(time, start, end, n_points, for_deriv=True)
 
         # The derivative of the altitude with respect to time is increasing
         # from negative to positive values at the anti-transit of the meridian
@@ -906,7 +1088,8 @@ class Observer(object):
 
         horizon = 0*u.degree  # Find when derivative passes through zero
         al1, al2, jd1, jd2 = self._horiz_cross(dt, d_altitudes,
-                                               rise_set, horizon)
+                                               rise_set, horizon,
+                                               prev_next=prev_next)
         return self._two_point_interp(jd1, jd2, al1, al2,
                                       horizon=horizon)
 
@@ -943,23 +1126,25 @@ class Observer(object):
         if not isinstance(time, Time):
             time = Time(time)
 
-        if which == 'next' or which == 'nearest':
-            next_event = event_function('next')
-            if which == 'next':
-                return next_event
+        if which == 'next':
+            return event_function('next')
 
-        if which == 'previous' or which == 'nearest':
-            previous_event = event_function('previous')
-            if which == 'previous':
-                return previous_event
+        if which == 'previous':
+            return event_function('previous')
 
         if which == 'nearest':
-            try:
-                mask = abs(time - previous_event) < abs(time - next_event)
-                ma = np.where(mask, previous_event.utc.jd, next_event.utc.jd)
-            except TypeError:
-                # encountered if time is scalar & nan
-                ma = next_event.utc.jd if not next_event.isscalar else [next_event.utc.jd]
+            # Only warn about a missing event if neither side has one
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                next_jd = _event_jds(event_function('next'))
+                previous_jd = _event_jds(event_function('previous'))
+            time_jd = time.utc.jd
+            use_previous = (np.isnan(next_jd) |
+                            (abs(time_jd - previous_jd) < abs(time_jd - next_jd)))
+            ma = np.where(use_previous, previous_jd, next_jd)
+            if np.isnan(ma).any():
+                for w in caught:
+                    warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
             return Time(_process_nans_in_jds(ma), format='jd', scale='utc')
 
         raise ValueError('"which" kwarg must be "next", "previous" or '
@@ -1734,7 +1919,7 @@ class Observer(object):
         if not isinstance(time, Time):
             time = Time(time)
 
-        moon = get_moon(time, location=self.location, ephemeris=ephemeris)
+        moon = get_body("moon", time, location=self.location, ephemeris=ephemeris)
         return self.altaz(time, moon)
 
     def sun_altaz(self, time):
@@ -1939,9 +2124,15 @@ class Observer(object):
         -------
         hour_angle : `~astropy.coordinates.Angle`
             The hour angle(s) of the target(s) at ``time``
+
+        Notes
+        -----
+        The hour angle is computed in the apparent topocentric
+        `~astropy.coordinates.HADec` frame, which accounts for precession,
+        nutation, aberration and topocentric parallax. Refraction is not
+        applied.
         """
-        time, target = self._preprocess_inputs(time, target, grid_times_targets)
-        return Longitude(self.local_sidereal_time(time) - target.ra)
+        return Longitude(self._hadec(time, target, grid_times_targets).ha)
 
     @u.quantity_input(horizon=u.degree)
     def tonight(self, time=None, horizon=0 * u.degree, obswl=None):

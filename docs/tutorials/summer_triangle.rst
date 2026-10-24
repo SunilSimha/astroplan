@@ -214,7 +214,7 @@ can plot it over the course of the night (for more on plotting see :doc:`plots`)
     import astropy.units as u
     from astropy.coordinates import EarthLocation, SkyCoord
     import matplotlib.pyplot as plt
-    from pytz import timezone
+    from zoneinfo import ZoneInfo
 
     from astroplan import Observer, FixedTarget
     from astroplan.plots import plot_airmass
@@ -226,7 +226,7 @@ can plot it over the course of the night (for more on plotting see :doc:`plots`)
 
     subaru = Observer(name='Subaru Telescope',
                       location=location,
-                      timezone=timezone('US/Hawaii'),
+                      timezone=ZoneInfo('US/Hawaii'),
                       description="Subaru Telescope on Maunakea, Hawaii")
 
     coordinates = SkyCoord('19h50m47.6s', '+08d52m12.0s', frame='icrs')
@@ -303,7 +303,7 @@ customizing plots and the like):
 
     import astropy.units as u
     from astropy.coordinates import EarthLocation
-    from pytz import timezone
+    from zoneinfo import ZoneInfo
     from astroplan import Observer
 
     longitude = '-155d28m48.900s'
@@ -313,7 +313,7 @@ customizing plots and the like):
 
     subaru = Observer(name='Subaru Telescope',
                    location=location,
-                   timezone=timezone('US/Hawaii'),
+                   timezone=ZoneInfo('US/Hawaii'),
                    description="Subaru Telescope on Maunakea, Hawaii")
 
     from astropy.coordinates import SkyCoord
@@ -348,13 +348,13 @@ We can also calculate the parallactic angle directly:
 .. code-block:: python
 
     >>> subaru.parallactic_angle(time, altair) # doctest: +SKIP
-    <Angle -0.6404957821112053 rad>
+    <Angle -0.65221265 rad>
 
     >>> subaru.parallactic_angle(time, vega) # doctest: +SKIP
-    <Angle -0.46542183982024 rad>
+    <Angle 2.68234741 rad>
 
     >>> subaru.parallactic_angle(time, deneb) # doctest: +SKIP
-    <Angle 0.7297067855978494 rad>
+    <Angle -2.40910593 rad>
 
 The `~astropy.coordinates.Angle` objects resulting from the calls to
 ``parallactic_angle()`` are subclasses of the `~astropy.units.Quantity`
@@ -458,7 +458,7 @@ targets lay in the sky:
     from astropy.time import Time
     import astropy.units as u
     import matplotlib.pyplot as plt
-    from pytz import timezone
+    from zoneinfo import ZoneInfo
 
     from astroplan import Observer, FixedTarget
     from astroplan.plots import plot_sky
@@ -470,7 +470,7 @@ targets lay in the sky:
 
     subaru = Observer(name='Subaru Telescope',
                       location=location,
-                      timezone=timezone('US/Hawaii'),
+                      timezone=ZoneInfo('US/Hawaii'),
                       description="Subaru Telescope on Maunakea, Hawaii")
 
     coordinates = SkyCoord('19h50m47.6s', '+08d52m12.0s', frame='icrs')
@@ -534,7 +534,7 @@ We can also show how our targets move over time during the night in question::
     from astropy.time import Time
     import astropy.units as u
     import matplotlib.pyplot as plt
-    from pytz import timezone
+    from zoneinfo import ZoneInfo
 
     from astroplan import Observer, FixedTarget
     from astroplan.plots import plot_sky
@@ -546,7 +546,7 @@ We can also show how our targets move over time during the night in question::
 
     subaru = Observer(name='Subaru Telescope',
                       location=location,
-                      timezone=timezone('US/Hawaii'),
+                      timezone=ZoneInfo('US/Hawaii'),
                       description="Subaru Telescope on Maunakea, Hawaii")
 
     coordinates = SkyCoord('19h50m47.6s', '+08d52m12.0s', frame='icrs')

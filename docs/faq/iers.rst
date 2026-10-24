@@ -46,7 +46,7 @@ What are IERS Bulletins A and B?
 ================================
 
 The `International Earth Rotation and Reference Systems Service (IERS)
-<http://www.iers.org/>`_ is responsible for measuring the Earth's orientation as
+<https://www.iers.org/>`_ is responsible for measuring the Earth's orientation as
 a function of time, and making predictions for the Earth's orientation in the
 near future (accounting for scheduled leap seconds). The data products released
 by the IERS used by astroplan are the IERS Bulletins A and B.
@@ -78,16 +78,14 @@ astropy's IERS machinery:
     import numpy as np
     import astropy.units as u
     from astropy.time import Time
-    from six.moves.urllib.error import HTTPError
 
-    # Download and cache the IERS Bulletins A and B  using astropy's machinery
-    # (reminder: astroplan has its own function for this: `download_IERS_A`)
-    from astropy.utils.iers import (IERS_A, IERS_A_URL, IERS_B, IERS_B_URL,
-                                    FROM_IERS_B, IERS_Auto)
-    from astropy.utils.data import download_file
-    # Workaround until astropy/astropy#5194 is solved
+    # Load IERS Bulletin A (downloaded and cached by astropy, falling back to
+    # Bulletin B if the download fails) and the Bulletin B table bundled with
+    # astropy (reminder: astroplan has its own function for downloading
+    # Bulletin A: `download_IERS_A`)
+    from astropy.utils.iers import IERS_B, FROM_IERS_B, IERS_Auto
     iers_a = IERS_Auto.open()
-    iers_b = IERS_B.open(download_file(IERS_B_URL, cache=True))
+    iers_b = IERS_B.open()
 
     # Get a range of times to plot from 1990-2022
     time_range = Time("1990-01-01") + np.arange(0, 30, 0.2)*u.year
@@ -107,10 +105,11 @@ astropy's IERS machinery:
     fig, ax = plt.subplots(figsize=(10,8))
     ax.axhline(0, color='gray', ls='--', lw=2)
 
-    ax.plot_date(time_range.plot_date,
-                 DUT1_a, '-', lw=2, label='IERS Bulletin A + extrapolation')
-    ax.plot_date(time_range.plot_date[measurements_from_b],
-                 DUT1_b[measurements_from_b], 'r--', lw=2, label='IERS Bulletin B')
+    ax.plot(time_range.plot_date,
+            DUT1_a, '-', lw=2, label='IERS Bulletin A + extrapolation')
+    ax.plot(time_range.plot_date[measurements_from_b],
+            DUT1_b[measurements_from_b], 'r--', lw=2, label='IERS Bulletin B')
+    ax.xaxis_date()
     ax.set(xlabel='Year', ylabel='UT1-UTC [seconds]')
     ax.legend(loc='upper right')
     plt.show()

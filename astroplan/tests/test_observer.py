@@ -1,25 +1,24 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
 
 # Standard library
 import datetime
 
 # Third-party
 import astropy.units as u
-from astropy.time import Time
-import pytest
 import numpy as np
-from numpy.testing import assert_allclose
-import pytz
+import pytest
+import zoneinfo
 from astropy.coordinates import (EarthLocation, Latitude, Longitude, SkyCoord,
-                                 AltAz, Angle)
+                                 AltAz, Angle, FK5, HADec, TETE, get_body, get_sun)
 from astropy.tests.helper import assert_quantity_allclose
+from astropy.time import Time
+from astropy.utils.exceptions import AstropyDeprecationWarning
+from numpy.testing import assert_allclose
 
 # Package
-from ..observer import Observer
-from ..target import FixedTarget
-from ..exceptions import TargetAlwaysUpWarning, TargetNeverUpWarning
+from astroplan.observer import Observer
+from astroplan.target import FixedTarget, AltAzTarget, MoonFlag, SunFlag
+from astroplan.exceptions import TargetAlwaysUpWarning, TargetNeverUpWarning
 
 
 def test_Observer_constructor_location():
@@ -148,6 +147,78 @@ def test_altaz_multiple_targets():
     assert all(ft_vector_alt[2, :] == sirius_alt)
 
 
+def test_altaz_scalar_time_grid_shape():
+    location = EarthLocation.from_geodetic(10*u.deg, 45*u.deg, 0*u.m)
+    observer = Observer(location=location)
+    time = Time("2026-02-05T00:00:00", scale="utc")
+    coords = SkyCoord([10, 20]*u.deg, [30, 40]*u.deg)
+    fixed_targets = [FixedTarget(coord=coord) for coord in coords]
+
+    for targets in (fixed_targets, coords):
+        assert observer.altaz(time, targets, grid_times_targets=True).shape == (2, 1)
+
+    horizontal = AltAzTarget(alt=30*u.deg, az=120*u.deg, location=location)
+    assert observer.altaz(time, horizontal, grid_times_targets=True).shape == (1, 1)
+    assert observer.altaz(
+        time, [fixed_targets[0], horizontal], grid_times_targets=True
+    ).shape == (2, 1)
+
+
+def test_altaz_roundtrip_for_altaztarget():
+    location = EarthLocation.from_geodetic(10*u.deg, 45*u.deg, 0*u.m)
+    observer = Observer(location=location)
+
+    t = Time("2026-01-01T00:00:00", scale="utc")
+    alt = 42*u.deg
+    az = 123*u.deg
+
+    target = AltAzTarget(alt=alt, az=az, location=location, name="horiz")
+
+    # If AltAzTarget evaluates to ICRS at time t, transforming back to AltAz at t
+    # should recover the original horizontal direction (within numerical tolerance).
+    a = observer.altaz(t, target)
+
+    assert np.allclose(a.alt.to_value(u.deg), alt.to_value(u.deg), atol=1e-10)
+    assert np.allclose(a.az.wrap_at(360*u.deg).to_value(u.deg),
+                       az.to_value(u.deg), atol=1e-10)
+
+
+def test_altaz_accepts_altaztarget():
+    location = EarthLocation.from_geodetic(10*u.deg, 45*u.deg, 0*u.m)
+    obs = Observer(location=location)
+    target = AltAzTarget(alt=60*u.deg, az=180*u.deg, location=location, name="horiz")
+
+    # Vector time, no grid
+    t0 = Time("2026-02-05T00:00:00", scale="utc")
+    times = t0 + np.arange(5) * u.hour
+    altaz = obs.altaz(times, target)
+    assert altaz.alt.shape == times.shape
+    assert altaz.az.shape == times.shape
+    # AltAzTarget evaluates to ICRS at time t, transforming back to AltAz at t
+    # should recover the original horizontal direction (within numerical tolerance).
+    assert np.allclose(altaz.alt.to_value(u.deg), 60.0)
+    assert np.allclose(altaz.az.to_value(u.deg), 180.0)
+
+    # Vector time, grid
+    altaz_grid = obs.altaz(times, target, grid_times_targets=True)
+    assert altaz_grid.alt.shape == (1, len(times))
+    assert altaz_grid.az.shape == (1, len(times))
+    assert np.allclose(altaz_grid.alt[0].to_value(u.deg), 60.0)
+    assert np.allclose(altaz_grid.az[0].to_value(u.deg), 180.0)
+
+    # Vector time, grid, multiple targets
+    targets = [
+        AltAzTarget(alt=60*u.deg, az=180*u.deg, location=location, name="h1"),
+        AltAzTarget(alt=45*u.deg, az=90*u.deg, location=location, name="h2"),
+        AltAzTarget(alt=35*u.deg, az=10*u.deg, location=location, name="h3"),
+    ]
+    altaz_grid = obs.altaz(times, targets, grid_times_targets=True)
+    assert altaz_grid.alt.shape == (len(targets), len(times))
+    assert np.allclose(altaz_grid.alt[0].to_value(u.deg), 60.0)
+    assert np.allclose(altaz_grid.alt[1].to_value(u.deg), 45.0)
+    assert np.allclose(altaz_grid.alt[2].to_value(u.deg), 35.0)
+
+
 def test_rise_set_transit_nearest_vector():
     vega = SkyCoord(279.23473479*u.deg, 38.78368896*u.deg)
     mira = SkyCoord(34.83663376*u.deg, -2.97763767*u.deg)
@@ -159,22 +230,27 @@ def test_rise_set_transit_nearest_vector():
     time = Time('2022-06-21 00:00:00')
 
     obs = Observer(location=location)
-    rise_vector = obs.target_rise_time(time, sc_list)
+
+    with pytest.warns(TargetAlwaysUpWarning):
+        rise_vector = obs.target_rise_time(time, sc_list)
+        polaris_rise = obs.target_rise_time(time, polaris)
+
     vega_rise = obs.target_rise_time(time, vega)
     mira_rise = obs.target_rise_time(time, mira)
     sirius_rise = obs.target_rise_time(time, sirius)
-    polaris_rise = obs.target_rise_time(time, polaris)
 
     assert rise_vector[0] == vega_rise
     assert rise_vector[1] == mira_rise
     assert rise_vector[2] == sirius_rise
     assert rise_vector[3].value.mask and polaris_rise.value.mask
 
-    set_vector = obs.target_set_time(time, sc_list)
+    with pytest.warns(TargetAlwaysUpWarning):
+        set_vector = obs.target_set_time(time, sc_list)
+        polaris_set = obs.target_set_time(time, polaris)
+
     vega_set = obs.target_set_time(time, vega)
     mira_set = obs.target_set_time(time, mira)
     sirius_set = obs.target_set_time(time, sirius)
-    polaris_set = obs.target_set_time(time, polaris)
 
     assert set_vector[0] == vega_set
     assert set_vector[1] == mira_set
@@ -223,85 +299,147 @@ def test_Observer_timezone_parser():
     location = EarthLocation.from_geodetic(lon, lat, elevation)
 
     obs1 = Observer(name='Observatory', location=location,
-                    timezone=pytz.timezone('UTC'))
+                    timezone=zoneinfo.ZoneInfo('UTC'))
     obs2 = Observer(name='Observatory', location=location, timezone='UTC')
     obs3 = Observer(name='Observatory', location=location)
 
     assert obs1.timezone == obs2.timezone, ('Accept both strings to pass to '
-                                            'the pytz.timezone() constructor '
-                                            'and instances of pytz.timezone')
+                                            'the zoneinfo.ZoneInfo() constructor '
+                                            'and instances of zoneinfo.ZoneInfo')
 
     assert obs2.timezone == obs3.timezone, ('Default timezone should be UTC')
 
 
 def test_parallactic_angle():
     """
-    Compute parallactic angle for targets at hour angle = {3, 19} for
-    at observer at IRTF using the online SpeX calculator and PyEphem
+    Compare parallactic angles at IRTF with values computed from PyEphem's
+    apparent topocentric hour angle and declination
+    (see ``print_pyephem_parallactic_angle``).
     """
-    # Set up position for IRTF
     lat = 19.826218*u.deg
     lon = -155.471999*u.deg
     elevation = 4160.0 * u.m
     location = EarthLocation.from_geodetic(lon, lat, elevation)
+    obs = Observer(location=location)
+
     time = Time('2015-01-01 00:00:00')
     LST = time.sidereal_time('mean', longitude=lon)
-    desired_HA_1 = 3*u.hourangle
-    desired_HA_2 = 19*u.hourangle  # = -5*u.hourangle
-    target1 = SkyCoord(LST - desired_HA_1, -30*u.degree)
-    target2 = SkyCoord(LST - desired_HA_2, -30*u.degree)
-
-    obs = Observer(location=location)
+    target1 = SkyCoord(LST - 3*u.hourangle, -30*u.degree)
+    target2 = SkyCoord(LST - 19*u.hourangle, -30*u.degree)  # HA = -5h
     q1 = obs.parallactic_angle(time, target1)
     q2 = obs.parallactic_angle(time, target2)
     q12 = obs.parallactic_angle(time, [target1, target2])
 
-    # Get values from PyEphem for comparison from print_pyephem_parallactic_angle()
-    pyephem_q1 = 46.54610060782033*u.deg
-    pyephem_q2 = -65.51818282032019*u.deg
+    time_2026 = Time('2026-10-16 10:00:00')
+    q3 = obs.parallactic_angle(time_2026, SkyCoord(90*u.deg, 80*u.deg))
+    q4 = obs.parallactic_angle(time_2026, SkyCoord(0*u.deg, -30*u.deg))
 
-    assert_quantity_allclose(q1, pyephem_q1, atol=1*u.deg)
-    assert_quantity_allclose(q2, pyephem_q2, atol=1*u.deg)
+    pyephem_q1 = 46.54238596266562*u.deg
+    pyephem_q2 = -65.52085647825521*u.deg
+    pyephem_q3 = -104.51765921139602*u.deg
+    pyephem_q4 = 22.69727617097267*u.deg
 
-    # Get SpeX parallactic angle calculator values for comparison from
-    # http://irtfweb.ifa.hawaii.edu/cgi-bin/spex/parangle.cgi to produce
-
-    SpeX_q1 = 46.7237968*u.deg  # deg
-    SpeX_q2 = -65.428924*u.deg  # deg
-
-    assert_quantity_allclose(q1, SpeX_q1, atol=0.1*u.deg)
-    assert_quantity_allclose(q2, SpeX_q2, atol=0.1*u.deg)
+    # PyEphem ignores UT1-UTC (-0.46 s in 2015), which is a few arcsec here
+    assert_quantity_allclose(q1, pyephem_q1, atol=10*u.arcsec)
+    assert_quantity_allclose(q2, pyephem_q2, atol=10*u.arcsec)
+    assert_quantity_allclose(q3, pyephem_q3, atol=10*u.arcsec)
+    assert_quantity_allclose(q4, pyephem_q4, atol=10*u.arcsec)
 
     assert q1 == q12[0]
     assert q2 == q12[1]
 
 
+def test_parallactic_angle_frames():
+    """
+    The parallactic angle should not depend on the frame the target is given
+    in, and should be consistent with the apparent HADec frame.
+    """
+    obs = Observer.at_site('Subaru')
+    time = Time('2026-10-16 10:00:00')
+    target_icrs = SkyCoord(90*u.deg, 80*u.deg)
+    target_fk5 = target_icrs.transform_to(FK5(equinox='J2030'))
+
+    q_icrs = obs.parallactic_angle(time, target_icrs)
+    q_fk5 = obs.parallactic_angle(time, target_fk5)
+    assert_quantity_allclose(q_icrs, q_fk5, atol=1*u.arcsec)
+
+    hadec = target_icrs.transform_to(HADec(location=obs.location, obstime=time))
+    lat = obs.location.lat
+    expected = np.arctan2(np.sin(hadec.ha),
+                          np.tan(lat)*np.cos(hadec.dec) -
+                          np.sin(hadec.dec)*np.cos(hadec.ha))
+    assert_quantity_allclose(q_icrs, expected, atol=1*u.arcsec)
+
+    # At this date and declination, ignoring precession is wrong by > 1 deg
+    lst = time.sidereal_time('apparent', longitude=obs.location.lon)
+    H = lst - target_icrs.ra
+    naive = np.arctan2(np.sin(H),
+                       np.tan(lat)*np.cos(target_icrs.dec) -
+                       np.sin(target_icrs.dec)*np.cos(H))
+    assert abs(q_icrs - naive) > 1*u.deg
+
+
+def test_parallactic_angle_flags_and_grid():
+    obs = Observer.at_site('Subaru')
+    time = Time('2026-10-16 10:00:00')
+
+    moon = get_body('moon', time, location=obs.location)
+    assert_quantity_allclose(obs.parallactic_angle(time, MoonFlag),
+                             obs.parallactic_angle(time, moon))
+    assert_quantity_allclose(obs.parallactic_angle(time, SunFlag),
+                             obs.parallactic_angle(time, get_sun(time)))
+
+    times = time + np.arange(3)*u.hour
+    targets = [SkyCoord(0*u.deg, -30*u.deg), SkyCoord(90*u.deg, 20*u.deg)]
+    q = obs.parallactic_angle(times, targets, grid_times_targets=True)
+    assert q.shape == (2, 3)
+    assert_quantity_allclose(q[1, 2], obs.parallactic_angle(times[2], targets[1]))
+
+
+def test_parallactic_angle_kind_deprecated():
+    obs = Observer.at_site('Subaru')
+    time = Time('2026-10-16 10:00:00')
+    target = SkyCoord(0*u.deg, -30*u.deg)
+    with pytest.warns(AstropyDeprecationWarning):
+        q = obs.parallactic_angle(time, target, kind='mean')
+    assert q == obs.parallactic_angle(time, target)
+
+
 def print_pyephem_parallactic_angle():
-    # lat = 19.826218*u.deg
+    """
+    Print the PyEphem reference values used in ``test_parallactic_angle``.
+
+    These apply Meeus eqn (14.1) to PyEphem's apparent topocentric ``ha`` and
+    ``dec``. PyEphem's own ``Body.parallactic_angle()`` is not used because it
+    combines the apparent hour angle with the astrometric (J2000)
+    declination, which is off by up to a few arcmin at current epochs.
+    """
+    import ephem
+    lat = 19.826218*u.deg
     lon = -155.471999*u.deg
+    obs = ephem.Observer()
+    obs.lat = str(lat.value)
+    obs.lon = str(lon.value)
+    obs.elevation = 4160.0
+    obs.pressure = 0
+
+    def pyephem_q(time, ra, dec):
+        obs.date = ephem.Date(time.utc.datetime)
+        target = ephem.FixedBody()
+        target._ra = ephem.degrees(ra.to_value(u.rad))
+        target._dec = ephem.degrees(dec.to_value(u.rad))
+        target.compute(obs)
+        H, d = float(target.ha), float(target.dec)
+        return np.arctan2(np.sin(H), np.tan(lat)*np.cos(d) -
+                          np.sin(d)*np.cos(H)).to(u.deg)
+
     time = Time('2015-01-01 00:00:00')
     LST = time.sidereal_time('mean', longitude=lon)
-    desired_HA_1 = 3*u.hourangle
-    desired_HA_2 = 19*u.hourangle  # = -5*u.hourangle
-
-    import ephem
-    obs = ephem.Observer()
-    obs.lat = '19:49:34.3848'
-    obs.lon = '-155:28:19.1964'
-    obs.elevation = 0
-    obs.date = time.datetime
-    pyephem_target1 = ephem.FixedBody()
-    pyephem_target1._ra = ephem.degrees((LST - desired_HA_1).to(u.rad).value)
-    pyephem_target1._dec = ephem.degrees((-30*u.deg).to(u.rad).value)
-    pyephem_target1.compute(obs)
-    pyephem_q1 = (float(pyephem_target1.parallactic_angle())*u.rad).to(u.deg)
-
-    pyephem_target2 = ephem.FixedBody()
-    pyephem_target2._ra = ephem.degrees((LST - desired_HA_2).to(u.rad).value)
-    pyephem_target2._dec = ephem.degrees((-30*u.deg).to(u.rad).value)
-    pyephem_target2.compute(obs)
-    pyephem_q2 = (float(pyephem_target2.parallactic_angle())*u.rad).to(u.deg)
-    print(pyephem_q1, pyephem_q2)
+    time_2026 = Time('2026-10-16 10:00:00')
+    print(pyephem_q(time, LST - 3*u.hourangle, -30*u.deg),
+          pyephem_q(time, LST - 19*u.hourangle, -30*u.deg),
+          pyephem_q(time_2026, 90*u.deg, 80*u.deg),
+          pyephem_q(time_2026, 0*u.deg, -30*u.deg))
 
 
 def test_sunrise_sunset_equator():
@@ -1060,9 +1198,19 @@ def test_mixed_rise_and_dont_rise():
     assert issubclass(w.category, TargetAlwaysUpWarning)
 
 
-def test_timezone_convenience_methods():
+@pytest.mark.parametrize('timezone', [
+    pytest.param('US/Eastern', id='str'),
+    pytest.param(zoneinfo.ZoneInfo('US/Eastern'), id='zoneinfo'),
+    # pytz timezones are no longer created by astroplan, but user-supplied
+    # ones must still be localized correctly.
+    pytest.param('pytz', id='pytz'),
+])
+def test_timezone_convenience_methods(timezone):
+    if timezone == 'pytz':
+        pytz = pytest.importorskip('pytz')
+        timezone = pytz.timezone('US/Eastern')
     location = EarthLocation(-74.0*u.deg, 40.7*u.deg, 0*u.m)
-    obs = Observer(location=location, timezone=pytz.timezone('US/Eastern'))
+    obs = Observer(location=location, timezone=timezone)
     t = Time(57100.3, format='mjd')
     assert (obs.astropy_time_to_datetime(t).hour == 3)
 
@@ -1089,6 +1237,7 @@ def test_timezone_convenience_methods():
     assert all(naive_dts == times_dt_ndarray - datetime.timedelta(hours=4))
 
 
+@pytest.mark.remote_data
 def test_is_night():
     lco = Observer(location=EarthLocation.of_site('lco'))  # Las Campanas
     aao = Observer(location=EarthLocation.of_site('aao'))  # Sydney, Australia
@@ -1209,16 +1358,25 @@ def print_pyephem_lst():
 
 
 def test_hour_angle():
-    # TODO: Add tests for different targets/times with tools other than PyEphem
     time = Time('2005-02-03 00:00:00')
     location = EarthLocation.from_geodetic(10*u.deg, 40*u.deg, 0*u.m)
     obs = Observer(location=location)
-    vernal_eq = FixedTarget(SkyCoord(ra=0*u.deg, dec=0*u.deg))
-    hour_angle = obs.target_hour_angle(time, vernal_eq)
-    lst = obs.local_sidereal_time(time)
-    assert_quantity_allclose(hour_angle, lst, atol=0.001*u.deg)
+    target = SkyCoord(ra=0*u.deg, dec=0*u.deg)
+    hour_angle = obs.target_hour_angle(time, FixedTarget(target))
+
+    # Independent route: apparent sidereal time minus the topocentric RA in
+    # the true equator, true equinox of date frame
+    lst = obs.local_sidereal_time(time, kind='apparent')
+    apparent = target.transform_to(TETE(obstime=time, location=location))
+    assert_quantity_allclose(hour_angle, Longitude(lst - apparent.ra),
+                             atol=0.1*u.arcsec)
+
+    # The ICRS RA alone is off by ~4 arcmin of precession at this date
+    assert abs(Longitude(lst - target.ra).wrap_at(180*u.deg) -
+               hour_angle.wrap_at(180*u.deg)) > 2*u.arcmin
 
 
+@pytest.mark.remote_data
 def test_tonight():
     obs = Observer.at_site('Subaru')
     obs.height = 0 * u.m
@@ -1327,6 +1485,110 @@ mmto_sunsets = [
 ]
 
 
+@pytest.mark.parametrize('event', ['target_rise_time', 'target_set_time'])
+def test_next_event_just_after_reference_time(event):
+    """
+    Regression test for #464: an event shortly after the reference time must
+    not be skipped in favour of the same event one sidereal day later, which
+    also falls within the 24 hour search grid.
+    """
+    observer = Observer(location=EarthLocation.from_geodetic(-110*u.deg, 32*u.deg,
+                                                             2000*u.m))
+    targets = [FixedTarget(SkyCoord(15*u.deg, -26*u.deg)),
+               FixedTarget(SkyCoord(200*u.deg, 10*u.deg))]
+    func = getattr(observer, event)
+    event_times = func(Time('2026-01-30 00:00'), targets, which='next')
+
+    for target, event_time in zip(targets, event_times):
+        for which, offset in [('next', -2*u.min), ('previous', 2*u.min),
+                              ('nearest', -2*u.min), ('nearest', 2*u.min)]:
+            result = func(event_time + offset, target, which=which)
+            assert abs(result - event_time) < 1*u.s
+
+    # also with several targets at once on a times x targets grid
+    results = func(event_times - 2*u.min, targets, which='next',
+                   grid_times_targets=True)
+    assert_quantity_allclose((results.diagonal() - event_times).to(u.s),
+                             0*u.s, atol=1*u.s)
+
+
+lasilla = EarthLocation.from_geodetic(-70.73*u.deg, -29.256667*u.deg, 2347*u.m)
+soar = EarthLocation.from_geodetic('-70d44m01.11s', '-30d14m16.41s', 2748*u.m)
+madrid = EarthLocation.from_geodetic(-3.7*u.deg, 40.41*u.deg, 650*u.m)
+
+
+@pytest.mark.parametrize('location, method, time, which, expected', [
+    # #533: the previous twilight was 4 s before the reference time, and the
+    # next one is a day and a minute later
+    (lasilla, 'twilight_evening_nautical', '2022-11-03', 'next',
+     '2022-11-04 00:00:51'),
+    # #608: the next twilight is a day and a few seconds later
+    (soar, 'twilight_morning_astronomical', '2024-12-09T07:58:00.468', 'next',
+     '2024-12-10 07:58:03'),
+    (soar, 'twilight_morning_astronomical', '2024-12-09T07:58:00.468', 'nearest',
+     '2024-12-09 07:57:59'),
+    (soar, 'twilight_evening_astronomical', '2024-12-09T01:13:07.968', 'nearest',
+     '2024-12-09 01:12:33'),
+    # #612: the Moon transits again more than a day later
+    (madrid, 'moon_transit_time', '2025-06-11 00:14:21.664266', 'next',
+     '2025-06-12 00:49:53'),
+    (madrid, 'moon_transit_time', '2025-06-11 00:14:21.664266', 'nearest',
+     '2025-06-10 23:55:01'),
+])
+def test_event_more_than_a_day_away(location, method, time, which, expected):
+    """
+    Regression test for #533, #608 and #612: events that recur slightly more
+    than a day apart must be found, and ``which='nearest'`` must not return a
+    masked time because the event on the other side is missing.
+    """
+    observer = Observer(location=location)
+    if method == 'moon_transit_time':
+        from astroplan.target import MoonFlag
+        result = observer.target_meridian_transit_time(Time(time), MoonFlag,
+                                                       which=which)
+    else:
+        result = getattr(observer, method)(Time(time), which=which)
+    assert not result.masked
+    assert abs(result - Time(expected)) < 2*u.s
+
+
+def test_midnight_at_midnight():
+    """
+    Regression test for #618: asking for the next or nearest midnight at
+    exactly a midnight returns that midnight.
+    """
+    apo = Observer(location=EarthLocation.from_geodetic(-105.82*u.deg, 32.78*u.deg,
+                                                        2798*u.m))
+    midnight = apo.midnight(Time('2025-06-09 12:00'))
+    for which in ['nearest', 'next']:
+        assert abs(apo.midnight(midnight, which=which) - midnight) < 1*u.s
+
+
+def test_nearest_with_only_previous_event():
+    """
+    Before polar night, ``which='nearest'`` returns the last sunset without
+    warning, and warns only once neither side has a sunset.
+    """
+    tromso = Observer(location=EarthLocation.from_geodetic(18.96*u.deg, 69.65*u.deg))
+    time = Time('2025-11-23 12:00')
+    with pytest.warns(TargetNeverUpWarning):
+        assert tromso.sun_set_time(time, which='next').mask
+    result = tromso.sun_set_time(time, which='nearest')
+    assert abs(result - Time('2025-11-22 10:55:23')) < 2*u.s
+    with pytest.warns(TargetNeverUpWarning):
+        assert tromso.sun_set_time(time + 1*u.day, which='nearest').mask
+
+
+@pytest.mark.parametrize('kwargs', [dict(rise_set='rise'),
+                                    dict(rise_set='rising', prev_next='nearest')])
+def test_horiz_cross_invalid_strings(kwargs):
+    observer = Observer(location=EarthLocation.from_geodetic(0*u.deg, 0*u.deg))
+    times = Time('2026-01-30') + np.linspace(0, 1, 10)[:, np.newaxis]*u.day
+    altitudes = np.linspace(-10, 10, 10)[:, np.newaxis]*u.deg
+    with pytest.raises(ValueError, match='must be'):
+        observer._horiz_cross(times, altitudes, **kwargs)
+
+
 @pytest.mark.parametrize('mmto_sunset', mmto_sunsets)
 def test_sun_set_vs_mmto_almanac(mmto_sunset):
     """
@@ -1346,6 +1608,7 @@ def test_sun_set_vs_mmto_almanac(mmto_sunset):
     assert abs(mmto_sunset - astroplan_sunset) < 1 * u.min
 
 
+@pytest.mark.remote_data
 def test_observer_lon_lat_el():
     """Test that astropy.EarthLocation conversion to longitude,
     latitude, and elevation works correctly.
@@ -1353,3 +1616,34 @@ def test_observer_lon_lat_el():
     obs = Observer.at_site('Subaru')
     for attr in ['longitude', 'latitude', 'elevation']:
         assert hasattr(obs, attr)
+
+
+@pytest.mark.remote_data
+def test_hash_observer():
+    """Test that Observer objects are hashable."""
+    obs1 = Observer.at_site('Subaru')
+    obs2 = Observer.at_site('Subaru')
+    assert hash(obs1) == hash(obs2)
+
+    obs3 = Observer.at_site('Keck', timezone='US/Hawaii')
+    assert hash(obs1) != hash(obs3)
+
+    obs4 = Observer.at_site('Keck', timezone='US/Hawaii')
+    assert hash(obs3) == hash(obs4)
+
+
+@pytest.mark.remote_data
+def test_eq_observer():
+    """Test that Observer objects are comparable."""
+    obs1 = Observer.at_site('Subaru')
+    obs2 = Observer.at_site('Subaru')
+    assert obs1 == obs2
+
+    obs3 = Observer.at_site('Keck')
+    assert obs1 != obs3
+
+    obs4 = Observer.at_site('Subaru', timezone='US/Hawaii')
+    assert obs1 != obs4
+
+    obs5 = Observer.at_site('Subaru', timezone='US/Hawaii')
+    assert obs4 == obs5
